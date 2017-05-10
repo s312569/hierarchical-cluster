@@ -2,7 +2,8 @@
   (:require [clj-recommendation.core :as rec]
             [clj-classify.core :as cl]
             [clojure.data.priority-map :as pm]
-            [clojure.zip :as z]))
+            [clojure.zip :as z]
+            [clojure.edn :as edn]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; cluster
@@ -27,17 +28,32 @@
          (map (fn [c x] [c x]) (iterate inc 0))
          (into pm))))
 
+(defn- next-neighbour
+  [pm s]
+  (let [ss (if (vector? s)
+             (-> (flatten s) set)
+             (set s))]
+    (->> (drop-while (fn [[k v]]
+                       (try (every? ss k)
+                            (catch Exception e
+                              (println k)
+                              (throw e))))
+                     pm)
+         first second)))
+
 (defn- cluster
   [q]
+;;  (println (take 2 q)) (println) (println)
   (loop [q q]
     (let [[x y & r] (seq q)]
       (if y
-        (let [mn (merge-with #(max %1 %2) (-> (second x) last) (-> (second y) last))]
-          (recur (conj (-> (pop q) pop)
-                       [(first x)
-                        [(-> (pop mn) first second)
-                         [(-> (second y) second) (-> (second x) second)]
-                         mn]])))
+        (let [mn (merge-with #(max %1 %2) (-> (second x) last) (-> (second y) last))
+              cl [(-> (second y) second) (-> (second x) second)]
+              nq (conj (-> (pop q) pop) [(first x) [(next-neighbour mn cl) cl mn]])]
+          ;; (doseq [[k v] nq]
+          ;;   (println (first v) " " (second v)))
+;;          (println (take 2 nq))(println) (println)
+          (recur nq))
         (drop 1 (second x))))))
 
 (defn hierarchical-cluster
@@ -55,7 +71,8 @@
   normalisation (default :mod-standard-score)."
   [data & {:keys [dist-method norm-method]
            :or {dist-method :euclidean norm-method :mod-standard-score}}]
-  (->> (init-queue data dist-method norm-method) cluster))
+  (let [pm (init-queue data dist-method norm-method)]
+    (cluster pm)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dendrogram
@@ -71,6 +88,14 @@
         (recur (z/next z) acc (inc level))
         (recur (z/next z) (cons (+ (count (z/node z)) (* 3 level)) acc) level))
       (apply max (cons (+ (count (z/node z)) (* 3 level)) acc)))))
+
+(defn- max-length
+  [z]
+  (->> (map #(+ (count (z/node %)) (* 3 (count (z/path %))))
+            (filter (complement z/branch?)
+                    (take-while (complement z/end?)
+                                (iterate z/next z))))
+       (apply max)))
 
 (defn- count-path
   [z]
@@ -128,7 +153,12 @@
           (do (update-actives actives bsh (- bsh 3)) [ns nl])
           (and (not (is-left? z)) (z/branch? (z/left z)))
           (do (update-actives actives bsh)
-              [nl (str (leaf-string z bsh) (levels actives bsh))])
+              (update-actives actives (- bsh 3))
+              [nl (str (str (z/node z)
+                            " "
+                            (apply str (repeat (- (- bsh 2) (count (z/node z))) "-"))
+                            "+"
+                            (levels actives bsh)))])
           :else [ns])))
 
 (defn- branch-print
@@ -137,7 +167,7 @@
     (when (z/left z)
       (when (two-nodes? z)
         (if-not (> (+ 6 bbh) h) (update-actives actives (+ bbh 3)))
-        [(str (apply str (repeat bbh " ")) "  |--+" (levels actives (+ bbh 3)))]))))
+        [(str (apply str (repeat bbh " ")) "  |--+" (levels actives (+ bbh 6)))]))))
 
 (defn dendrogram
   "Returns a collection of strings representing a dendrogram of a
@@ -158,3 +188,5 @@
   [coll]
   (doseq [l (dendrogram coll)]
     (println l)))
+
+(def ccr [["Total Raisin Bran" ["Just Right Fruit & Nut" ["Product 19" ["Total Whole Grain" ["Just Right Crunchy  Nuggets" "Total Corn Flakes"]]]]] ["Quaker Oatmeal" [["All-Bran with Extra Fiber" ["100% Bran" "All-Bran"]] ["100% Natural Bran" [["Cheerios" "Special K"] [["Puffed Rice" "Puffed Wheat"] [[["Mueslix Crispy Blend" ["Muesli Raisins & Almonds" "Muesli Peaches & Pecans"]] [["Frosted Mini-Wheats" ["Raisin Squares" "Strawberry Fruit Wheats"]] ["Maypo" ["Bran Flakes" [["Fruit & Fibre" ["Fruitful Bran" ["Post Nat. Raisin Bran" "Raisin Bran"]]] ["Great Grains Pecan" ["Honey Nut Cheerios" ["Crispy Wheat & Raisins" ["Cracklin' Oat Bran" [["Oatmeal Raisin Crisp" ["Basic 4" "Nutri-Grain Almond-Raisin"]] [["Double Chex" [["Kix" "Triples"] ["Rice Chex" ["Crispix" ["Corn Flakes" ["Corn Chex" "Rice Krispies"]]]]]] ["Golden Grahams" ["Almond Delight" [["Apple Cinnamon Cheerios" ["Cinnamon Toast Crunch" ["Cap'n Crunch" "Honey Graham Ohs"]]] [["Grape-Nuts" "Nutri-grain Wheat"] [[["Quaker Oat Squares" ["Grape Nuts Flakes" ["Wheat Chex" "Wheaties"]]] ["Life" ["Clusters" "Raisin Nut Bran"]]] ["Bran Chex" ["Golden Crisp" [["Frosted Flakes" "Honey-comb"] ["Corn Pops" [["Multi-Grain Cheerios" ["Nut&Honey Crunch" "Wheaties Honey Gold"]] ["Apple Jacks" [["Lucky Charms" [["Fruity Pebbles" "Trix"] ["Cocoa Puffs" "Count Chocula"]]] ["Froot Loops" "Smacks"]]]]]]]]]]]]]]]]]]]]]]]] ["Cream of Wheat [Quick]" ["Shredded Wheat" ["Shredded Wheat 'n Bran" "Shredded Wheat spoon size"]]]]]]]]]])
