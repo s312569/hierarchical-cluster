@@ -8,7 +8,7 @@ purposes and in beta.
 Add the library to your project.clj file:
 
 ```clojure
-[hierarchical-cluster "0.1.1"]
+[hierarchical-cluster "0.1.2"]
 ```
 
 Then require:
