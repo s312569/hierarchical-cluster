@@ -22,14 +22,14 @@
                           ["Boston Terrier"
                            [["Portuguese Water Dog" "Border Collie"] "Brittany Spaniel"]]]]]]])
 
-(defonce dog-dendrogram '("Yorkshire Terrier ----------------------------+" "                                              |--+" "Chihuahua ------------------------------------+  |" "                                                 |--+" "Great Dane -----------------------------------+  |" "                                              |--+" "Bullmastiff -------------------------------+  |" "                                           |--+" "German Shepherd ---------------------+     |" "                                     |--+  |" "Golden Retriever --------------------+  |  |" "                                        |--+" "Standard Poodle ---------------------+  |" "                                     |--+" "Boston Terrier -------------------+  |" "                                  |--+" "Portuguese Water Dog -------+     |" "                            |--+  |" "Border Collie --------------+  |  |" "                               |--+" "Brittany Spaniel --------------+"))
+(defonce dog-dendrogram '("Yorkshire Terrier ----------------------+" "                                        |--+" "Chihuahua ------------------------------+  |" "                                           |--+" "Great Dane -----------------------------+  |" "                                        |--+" "Bullmastiff -------------------------+  |" "                                     |--+" "German Shepherd ---------------+     |" "                               |--+  |" "Golden Retriever --------------+  |  |" "                                  |--+" "Standard Poodle ---------------+  |" "                               |--+" "Boston Terrier -------------+  |" "                            |--+" "Portuguese Water Dog -+     |" "                      |--+  |" "Border Collie --------+  |  |" "                         |--+" "Brittany Spaniel --------+"))
 
 (deftest cluster-test
   (testing "Clustering"
-    (is (= (-> (hierarchical-cluster dog-data) first) dog-cluster))))
+    (is (= (hierarchical-cluster dog-data) dog-cluster))))
 
 (deftest dendrogram-test
   (testing "Dendrogram"
-    (is (= (-> (hierarchical-cluster dog-data) first dendrogram)
+    (is (= (-> (hierarchical-cluster dog-data) dendrogram)
            dog-dendrogram))))
 

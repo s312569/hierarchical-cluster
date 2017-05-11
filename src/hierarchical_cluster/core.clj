@@ -13,8 +13,9 @@
   [d dist-method norm-method]
   (let [k (cl/knn-classifier d :dist-method dist-method :norm norm-method :k (count d))
         qk (fn [x] (-> (cons (first x) (-> (last x) first first vec sort)) vec))
-        qc (fn [x y] (compare (-> (cons (first y) (drop 1 x)) vec)
-                             (-> (cons (first x) (drop 1 y)) vec)))
+        qc (fn [x y]
+             (compare (-> (cons (first y) (drop 1 x)) vec)
+                      (-> (cons (first x) (drop 1 y)) vec)))
         pm (pm/priority-map-keyfn-by qk qc)]
     (->> (map (fn [x]
                 (let [p (pm/priority-map-by >)
@@ -33,75 +34,56 @@
   (let [ss (if (vector? s)
              (-> (flatten s) set)
              (set s))]
-    (->> (drop-while (fn [[k v]]
-                       (try (every? ss k)
-                            (catch Exception e
-                              (println k)
-                              (throw e))))
-                     pm)
-         first second)))
+    (-> (drop-while (fn [[k v]] (every? ss k)) pm) first second)))
 
 (defn- cluster
   [q]
-;;  (println (take 2 q)) (println) (println)
   (loop [q q]
     (let [[x y & r] (seq q)]
       (if y
         (let [mn (merge-with #(max %1 %2) (-> (second x) last) (-> (second y) last))
-              cl [(-> (second y) second) (-> (second x) second)]
+              cl (with-meta [(-> (second y) second) (-> (second x) second)]
+                   {:distance (-> (second x) first)})
               nq (conj (-> (pop q) pop) [(first x) [(next-neighbour mn cl) cl mn]])]
-          ;; (doseq [[k v] nq]
-          ;;   (println (first v) " " (second v)))
-;;          (println (take 2 nq))(println) (println)
           (recur nq))
-        (drop 1 (second x))))))
+        (-> (drop 1 (second x)) first)))))
 
 (defn hierarchical-cluster
-  "Performs hierarchical clustering and returns a vector the first
-  element of which is nested vector of vectors representing a binary
-  tree and the second a hash-map of distances used generating the
-  clusters. Data should be in the format of a collection of vectors,
-  the first element being the class the second a vector of attribute
-  values and the third a vector of comments. Distance method can be
-  specified with the :dist-method keyword, allowed values
-  are :euclidean, :manhattan, :cosine
+  "Performs hierarchical clustering and returns a nested vector of
+  vectors representing a binary tree with distance values for each
+  branch in the meta data of each vector. Data should be in the format
+  of a collection of vectors, the first element being the class the
+  second a vector of attribute values and the third a vector of
+  comments. Distance method can be specified with the :dist-method
+  keyword, allowed values are :euclidean, :manhattan, :cosine
   and :pearson (default :euclidean). Normalisation method can be
   specified using the :norm-method keyword, allowed values
   are :mod-standard-score, :standard-score, :min-max or false for no
   normalisation (default :mod-standard-score)."
   [data & {:keys [dist-method norm-method]
            :or {dist-method :euclidean norm-method :mod-standard-score}}]
-  (let [pm (init-queue data dist-method norm-method)]
-    (cluster pm)))
+  (-> (init-queue data dist-method norm-method) cluster))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dendrogram
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn- max-length
-  [z]
-  (loop [z z
-         acc nil
-         level 0]
-    (if-not (z/end? z)
-      (if (z/branch? z)
-        (recur (z/next z) acc (inc level))
-        (recur (z/next z) (cons (+ (count (z/node z)) (* 3 level)) acc) level))
-      (apply max (cons (+ (count (z/node z)) (* 3 level)) acc)))))
+(defn- string-n
+  [st n]
+  (apply str (repeat n st)))
 
 (defn- max-length
-  [z]
-  (->> (map #(+ (count (z/node %)) (* 3 (count (z/path %))))
-            (filter (complement z/branch?)
-                    (take-while (complement z/end?)
-                                (iterate z/next z))))
+  [z sep]
+  (->> (map #(+ (count (z/node %)) (* sep (count (z/path %))))
+            (->> (take-while (complement z/end?) (iterate z/next z))
+                 (filter (complement z/branch?))))
        (apply max)))
 
 (defn- count-path
-  [z]
+  [z sep]
   (if (z/branch? z)
-    (* 3 (count (z/path z)))
-    (* 3 (- (count (z/path z)) 1))))
+    (* sep (count (z/path z)))
+    (* sep (- (count (z/path z)) 1))))
 
 (defn- is-left?
   [z]
@@ -113,11 +95,11 @@
     (z/branch? r)))
 
 (defn- update-actives
-  [a & hs]
+  [a sep & hs]
   (swap! a #(reduce (fn [z y]
-                      (if (z (+ y 3))
-                        (dissoc z (+ y 3))
-                        (assoc z (+ y 3) 1)))
+                      (if (z (+ y sep))
+                        (dissoc z (+ y sep))
+                        (assoc z (+ y sep) 1)))
                     %
                     hs)))
 
@@ -127,7 +109,7 @@
        sort
        (reduce (fn [x y]
                  (let [a (reduce #(+ %1 (count %2)) 0 x)]
-                   (conj x (str (apply str (repeat (- (- y (+ h a)) 1) " ")) "|"))))
+                   (conj x (str (string-n " " (- (- y (+ h a)) 1)) "|"))))
                [])
        (apply str)))
 
@@ -137,56 +119,53 @@
        (z/left z)
        (-> (z/left z) z/branch?)))
 
+(defn- leaf-string
+  [z h actives]
+  (str (z/node z) " " (string-n "-" (- (- h 2) (count (z/node z))))
+       "+" (levels actives h)))
+
 (defn- leaf-print
-  [z actives h]
-  (let [bsh (- h (count-path z))
-        ns (str (z/node z)
-                " "
-                (apply str (repeat (- (- bsh 2) (count (z/node z))) "-"))
-                "+"
-                (levels actives bsh))
-        nl (str (apply str (repeat (- bsh 1) " ")) "|--+" (levels actives (+ bsh 3)))]
+  [z actives h sep]
+  (let [bsh (- h (count-path z sep))
+        ns (leaf-string z bsh actives)
+        nl (str (string-n " " (- bsh 1)) "|" (string-n "-" (- sep 1)) "+" (levels actives (+ bsh sep)))]
     (cond (and (is-left? z)
                (not (is-next-branch? z)))
-          (do (update-actives actives bsh) [ns nl])
+          (do (update-actives actives sep bsh) [ns nl])
           (and (is-left? z) (is-next-branch? z))
-          (do (update-actives actives bsh (- bsh 3)) [ns nl])
+          (do (update-actives actives sep bsh (- bsh sep)) [ns nl])
           (and (not (is-left? z)) (z/branch? (z/left z)))
-          (do (update-actives actives bsh)
-              (update-actives actives (- bsh 3))
-              [nl (str (str (z/node z)
-                            " "
-                            (apply str (repeat (- (- bsh 2) (count (z/node z))) "-"))
-                            "+"
-                            (levels actives bsh)))])
+          (do (update-actives actives sep bsh)
+              (update-actives actives sep (- bsh sep))
+              [nl (leaf-string z bsh actives)])
           :else [ns])))
 
 (defn- branch-print
-  [z actives h]
-  (let [bbh (- h (count-path z))]
+  [z actives h sep]
+  (let [bbh (- h (count-path z sep))]
     (when (z/left z)
       (when (two-nodes? z)
-        (if-not (> (+ 6 bbh) h) (update-actives actives (+ bbh 3)))
-        [(str (apply str (repeat bbh " ")) "  |--+" (levels actives (+ bbh 6)))]))))
+        (if-not (> (+ (* 2 sep) bbh) h) (update-actives actives sep (+ bbh sep)))
+        [(str (string-n " " bbh) (string-n " " (- sep 1)) "|"
+              (string-n "-" (- sep 1)) "+" (levels actives (+ bbh (* 2 sep))))]))))
 
 (defn dendrogram
   "Returns a collection of strings representing a dendrogram of a
   binary tree."
-  [coll]
+  [coll & {:keys [sep] :or {sep 3}}]
   (let [z (z/vector-zip coll)
-        h (max-length z)
+        h (max-length z sep)
         actives (atom {})]
     (mapcat #(if (z/branch? %)
-               (branch-print % actives h)
-               (leaf-print % actives h))
+               (branch-print % actives h sep)
+               (leaf-print % actives h sep))
             (take-while (complement z/end?)
                         (iterate z/next z)))))
 
 (defn print-dendrogram
   "Prints a dendrogram of a binary tree represented by a collection of
-  vectors representing the tree."
-  [coll]
-  (doseq [l (dendrogram coll)]
+  vectors."
+  [coll & {:keys [sep] :or {sep 3}}]
+  (doseq [l (dendrogram coll :sep sep)]
     (println l)))
 
-(def ccr [["Total Raisin Bran" ["Just Right Fruit & Nut" ["Product 19" ["Total Whole Grain" ["Just Right Crunchy  Nuggets" "Total Corn Flakes"]]]]] ["Quaker Oatmeal" [["All-Bran with Extra Fiber" ["100% Bran" "All-Bran"]] ["100% Natural Bran" [["Cheerios" "Special K"] [["Puffed Rice" "Puffed Wheat"] [[["Mueslix Crispy Blend" ["Muesli Raisins & Almonds" "Muesli Peaches & Pecans"]] [["Frosted Mini-Wheats" ["Raisin Squares" "Strawberry Fruit Wheats"]] ["Maypo" ["Bran Flakes" [["Fruit & Fibre" ["Fruitful Bran" ["Post Nat. Raisin Bran" "Raisin Bran"]]] ["Great Grains Pecan" ["Honey Nut Cheerios" ["Crispy Wheat & Raisins" ["Cracklin' Oat Bran" [["Oatmeal Raisin Crisp" ["Basic 4" "Nutri-Grain Almond-Raisin"]] [["Double Chex" [["Kix" "Triples"] ["Rice Chex" ["Crispix" ["Corn Flakes" ["Corn Chex" "Rice Krispies"]]]]]] ["Golden Grahams" ["Almond Delight" [["Apple Cinnamon Cheerios" ["Cinnamon Toast Crunch" ["Cap'n Crunch" "Honey Graham Ohs"]]] [["Grape-Nuts" "Nutri-grain Wheat"] [[["Quaker Oat Squares" ["Grape Nuts Flakes" ["Wheat Chex" "Wheaties"]]] ["Life" ["Clusters" "Raisin Nut Bran"]]] ["Bran Chex" ["Golden Crisp" [["Frosted Flakes" "Honey-comb"] ["Corn Pops" [["Multi-Grain Cheerios" ["Nut&Honey Crunch" "Wheaties Honey Gold"]] ["Apple Jacks" [["Lucky Charms" [["Fruity Pebbles" "Trix"] ["Cocoa Puffs" "Count Chocula"]]] ["Froot Loops" "Smacks"]]]]]]]]]]]]]]]]]]]]]]]] ["Cream of Wheat [Quick]" ["Shredded Wheat" ["Shredded Wheat 'n Bran" "Shredded Wheat spoon size"]]]]]]]]]])
