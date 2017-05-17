@@ -12,13 +12,16 @@
 (defn- init-queue
   [d dist-method norm-method type]
   (let [k (cl/knn-classifier d :dist-method dist-method :norm norm-method :k (count d))
-        qk (fn [x] (-> (cons (first x) (-> (last x) first first sort)) vec))
+        qk (fn [x] (-> (cons (if (number? (first x))
+                              (first x)
+                              (-> (first x) first))
+                            (->> (last x) first first sort)) vec))
         qc (fn [x y]
              (compare (-> (cons (first y) (drop 1 x)) vec)
                       (-> (cons (first x) (drop 1 y)) vec)))
         pm (pm/priority-map-keyfn-by qk qc)]
     (->> (map (fn [x]
-                (let [p (pm/priority-map-by >)
+                (let [p (pm/priority-map-keyfn-by (fn [x] (if (number? x) x (first x))) >)
                       nns (->> (rec/nearest-neighbours k x)
                                (filter #((complement #{(first x)}) (first %)))
                                (map (fn [[k v]] [[(first x) k] v]))
@@ -29,7 +32,43 @@
          (map (fn [c x] [c x]) (iterate inc 0))
          (into pm))))
 
-(defmulti cluster (fn [q t] t))
+(defmulti cluster-distance (fn [args t] t))
+
+(defmethod cluster-distance :complete
+  [[e-cl-set _ sims] _]
+  (->> (drop-while (fn [[k v]]
+                     (not (e-cl-set (second k))))
+                   (rseq sims))
+       first))
+
+(defmethod cluster-distance :average
+  [[e-cl-set sim-set sims] _]
+  (let [ks (mapcat (fn [x]
+                     (reduce (fn [z y] (conj z [x y]))
+                             []
+                             e-cl-set))
+                   sim-set)
+        dists (->> (select-keys sims (vec ks))
+                   (map (fn [[k v]] (if (number? v) [k [v 1]] [k v]))))
+        total (->> (map second dists) (map #(apply * %)) (reduce +))
+        count (->> (map second dists) (map second) (reduce +))]
+    [(first (first dists)) [(/ total count) count]]))
+
+(defn- update-similarities
+  [[index cluster sims] old-queue t]
+  (let [sim-set (-> cluster flatten set)
+        nq (->> (pmap (fn [[entry-index [_ entry-cl entry-sims]]]
+                        (let [e-cl-set (if (vector? entry-cl) (-> entry-cl flatten set) #{entry-cl})
+                              gdist (cluster-distance [e-cl-set sim-set sims] t)
+                              new-sims (conj (->> (filter (fn [[k v]] (not (sim-set (second k))))
+                                                          entry-sims)
+                                                  (into (empty entry-sims)))
+                                             [(-> (first gdist) reverse) (second gdist)])]
+                          [[entry-index [(-> (peek new-sims) second) entry-cl new-sims]] gdist]))
+                      old-queue))]
+    (conj (->> (map first nq) (into (empty old-queue)))
+          (let [n (->> (map second nq) (into (empty sims)))]
+            [index [(-> (peek n) second) cluster n]]))))
 
 (defn- merge-pms
   ([pm1 pm2] (merge-pms pm1 pm2 >))
@@ -42,37 +81,9 @@
         (map first)
         (into (empty pm1)))))
 
-(defmethod cluster :single
-  [q t]
-  (loop [q q]
-    (let [[x y & r] (seq q)]
-      (if y
-        (let [mn (merge-pms (-> (second x) last) (-> (second y) last))
-              cl (with-meta [(-> (second y) second) (-> (second x) second)]
-                   {:distance (-> (second x) first)})]
-          (recur (conj (-> (pop q) pop) [(first x) [(-> (peek mn) second) cl mn]])))
-        (-> (drop 1 (second x)) first)))))
+(defmulti cluster (fn [q t] t))
 
-(defn- update-similarities
-  [[index cluster sims] old-queue]
-  (let [sim-set (-> cluster flatten set)
-        nq (->> (pmap (fn [[entry-index [_ entry-cl entry-sims]]]
-                        (let [e-cl-set (if (vector? entry-cl) (-> entry-cl flatten set) #{entry-cl})
-                              gdist (->> (drop-while (fn [[k v]]
-                                                       (not (e-cl-set (second k))))
-                                                     (rseq sims))
-                                         first)
-                              new-sims (conj (->> (filter (fn [[k v]] (not (sim-set (second k))))
-                                                          entry-sims)
-                                                  (into (empty entry-sims)))
-                                             [(-> (first gdist) reverse) (second gdist)])]
-                          [[entry-index [(-> (peek new-sims) second) entry-cl new-sims]] gdist]))
-                      old-queue))]
-    (conj (->> (map first nq) (into (empty old-queue)))
-          (let [n (->> (map second nq) (into (empty sims)))]
-            [index [(-> (peek n) second) cluster n]]))))
-
-(defmethod cluster :complete
+(defmethod cluster :default
   [q t]
   (loop [q q]
     (let [[x y & r] (seq q)]
@@ -81,7 +92,19 @@
                                      (with-meta [(-> (second y) second) (-> (second x) second)]
                                        {:distance (-> (second x) first)})
                                      (merge (-> (second x) last) (-> (second y) last))]
-                                    (-> (pop q) pop)))
+                                    (-> (pop q) pop)
+                                    t))
+        (-> (drop 1 (second x)) first)))))
+
+(defmethod cluster :single
+  [q _]
+  (loop [q q]
+    (let [[x y & r] (seq q)]
+      (if y
+        (let [mn (merge-pms (-> (second x) last) (-> (second y) last))
+              cl (with-meta [(-> (second y) second) (-> (second x) second)]
+                   {:distance (-> (second x) first)})]
+          (recur (conj (-> (pop q) pop) [(first x) [(-> (peek mn) second) cl mn]])))
         (-> (drop 1 (second x)) first)))))
 
 (defn hierarchical-cluster
