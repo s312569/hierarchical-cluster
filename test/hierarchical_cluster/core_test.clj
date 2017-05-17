@@ -1,6 +1,9 @@
 (ns hierarchical-cluster.core-test
   (:require [clojure.test :refer :all]
-            [hierarchical-cluster.core :refer :all]))
+            [clj-classify.core :as cl]
+            [clojure.java.io :as io]
+            [hierarchical-cluster.core :refer :all]
+            [clojure.edn :as edn]))
 
 (defonce dog-data [["Border Collie" [20 45] []]
                    ["Boston Terrier" [16 20] []]
@@ -23,6 +26,25 @@
                            [["Portuguese Water Dog" "Border Collie"] "Brittany Spaniel"]]]]]]])
 
 (defonce dog-dendrogram '("Yorkshire Terrier ----------------------+" "                                        |--+" "Chihuahua ------------------------------+  |" "                                           |--+" "Great Dane -----------------------------+  |" "                                        |--+" "Bullmastiff -------------------------+  |" "                                     |--+" "German Shepherd ---------------+     |" "                               |--+  |" "Golden Retriever --------------+  |  |" "                                  |--+" "Standard Poodle ---------------+  |" "                               |--+" "Boston Terrier -------------+  |" "                            |--+" "Portuguese Water Dog -+     |" "                      |--+  |" "Border Collie --------+  |  |" "                         |--+" "Brittany Spaniel --------+"))
+
+(defonce test-data
+  [["A" [1 1]]
+   ["B" [1.5 1.5]]
+   ["C" [5 5]]
+   ["D" [3 4]]
+   ["E" [4 4]]
+   ["F" [3 3.5]]])
+
+(def cars (edn/read-string (slurp (io/resource "r-mtcar.clj"))))
+
+(def cereals (edn/read-string (slurp (io/resource "cereal.clj"))))
+
+(defn clj->R
+  [data file]
+  (with-open [w (io/writer file)]
+    (doseq [l data]
+      (.write w (->> (take 2 l) flatten (interpose ",") (apply str)))
+      (.write w "\n"))))
 
 (deftest cluster-test
   (testing "Clustering"

@@ -10,9 +10,9 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn- init-queue
-  [d dist-method norm-method]
+  [d dist-method norm-method type]
   (let [k (cl/knn-classifier d :dist-method dist-method :norm norm-method :k (count d))
-        qk (fn [x] (-> (cons (first x) (-> (last x) first first vec sort)) vec))
+        qk (fn [x] (-> (cons (first x) (-> (last x) first first sort)) vec))
         qc (fn [x y]
              (compare (-> (cons (first y) (drop 1 x)) vec)
                       (-> (cons (first x) (drop 1 y)) vec)))
@@ -21,7 +21,7 @@
                 (let [p (pm/priority-map-by >)
                       nns (->> (rec/nearest-neighbours k x)
                                (filter #((complement #{(first x)}) (first %)))
-                               (map (fn [[k v]] [(set [(first x) k]) v]))
+                               (map (fn [[k v]] [[(first x) k] v]))
                                (into p))
                       nn (first nns)]
                   [(second nn) (first x) nns]))
@@ -29,23 +29,59 @@
          (map (fn [c x] [c x]) (iterate inc 0))
          (into pm))))
 
-(defn- next-neighbour
-  [pm s]
-  (let [ss (if (vector? s)
-             (-> (flatten s) set)
-             (set s))]
-    (-> (drop-while (fn [[k v]] (every? ss k)) pm) first second)))
+(defmulti cluster (fn [q t] t))
 
-(defn- cluster
-  [q]
+(defn- merge-pms
+  ([pm1 pm2] (merge-pms pm1 pm2 >))
+  ([pm1 pm2 f]
+   (->> (seq (merge pm1 pm2))
+        (group-by #(second (first %)))
+        vals
+        (filter #(> (count %) 1))
+        (map #(sort-by second f %))
+        (map first)
+        (into (empty pm1)))))
+
+(defmethod cluster :single
+  [q t]
   (loop [q q]
     (let [[x y & r] (seq q)]
       (if y
-        (let [mn (merge-with #(max %1 %2) (-> (second x) last) (-> (second y) last))
+        (let [mn (merge-pms (-> (second x) last) (-> (second y) last))
               cl (with-meta [(-> (second y) second) (-> (second x) second)]
-                   {:distance (-> (second x) first)})
-              nq (conj (-> (pop q) pop) [(first x) [(next-neighbour mn cl) cl mn]])]
-          (recur nq))
+                   {:distance (-> (second x) first)})]
+          (recur (conj (-> (pop q) pop) [(first x) [(-> (peek mn) second) cl mn]])))
+        (-> (drop 1 (second x)) first)))))
+
+(defn- update-similarities
+  [[index cluster sims] old-queue]
+  (let [sim-set (-> cluster flatten set)
+        nq (->> (pmap (fn [[entry-index [_ entry-cl entry-sims]]]
+                        (let [e-cl-set (if (vector? entry-cl) (-> entry-cl flatten set) #{entry-cl})
+                              gdist (->> (drop-while (fn [[k v]]
+                                                       (not (e-cl-set (second k))))
+                                                     (rseq sims))
+                                         first)
+                              new-sims (conj (->> (filter (fn [[k v]] (not (sim-set (second k))))
+                                                          entry-sims)
+                                                  (into (empty entry-sims)))
+                                             [(-> (first gdist) reverse) (second gdist)])]
+                          [[entry-index [(-> (peek new-sims) second) entry-cl new-sims]] gdist]))
+                      old-queue))]
+    (conj (->> (map first nq) (into (empty old-queue)))
+          (let [n (->> (map second nq) (into (empty sims)))]
+            [index [(-> (peek n) second) cluster n]]))))
+
+(defmethod cluster :complete
+  [q t]
+  (loop [q q]
+    (let [[x y & r] (seq q)]
+      (if y
+        (recur (update-similarities [(first x)
+                                     (with-meta [(-> (second y) second) (-> (second x) second)]
+                                       {:distance (-> (second x) first)})
+                                     (merge (-> (second x) last) (-> (second y) last))]
+                                    (-> (pop q) pop)))
         (-> (drop 1 (second x)) first)))))
 
 (defn hierarchical-cluster
@@ -59,10 +95,13 @@
   and :pearson (default :euclidean). Normalisation method can be
   specified using the :norm-method keyword, allowed values
   are :mod-standard-score, :standard-score, :min-max or false for no
-  normalisation (default :mod-standard-score)."
-  [data & {:keys [dist-method norm-method]
-           :or {dist-method :euclidean norm-method :mod-standard-score}}]
-  (-> (init-queue data dist-method norm-method) cluster))
+  normalisation (default :mod-standard-score). Type of clustering can
+  be specified with the :type keyword, allowed values are :single
+  and :complete."
+  [data & {:keys [dist-method norm-method type]
+           :or {dist-method :euclidean norm-method :mod-standard-score
+                type :single}}]
+  (-> (init-queue data dist-method norm-method type) (cluster type)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dendrogram
@@ -94,24 +133,25 @@
   (if-let [r (z/right z)]
     (z/branch? r)))
 
-(defn- update-actives
-  [a sep & hs]
-  (swap! a #(reduce (fn [z y]
-                      (if (z (+ y sep))
-                        (dissoc z (+ y sep))
-                        (assoc z (+ y sep) 1)))
-                    %
-                    hs)))
-
-(defn- levels
-  [a h]
-  (->> (filter #(> % h) (keys @a))
-       sort
-       (reduce (fn [x y]
-                 (let [a (reduce #(+ %1 (count %2)) 0 x)]
-                   (conj x (str (string-n " " (- (- y (+ h a)) 1)) "|"))))
-               [])
-       (apply str)))
+(defn- active-updater
+  [h a sep]
+  [(fn [& hs]
+      (swap! a #(reduce (fn [z y]
+                          (if-not (> (+ sep y) h)
+                            (if (z (+ y sep))
+                              (dissoc z (+ y sep))
+                              (assoc z (+ y sep) 1))
+                            z))
+                        %
+                        hs)))
+   (fn [level]
+     (->> (filter #(> % level) (keys @a))
+          sort
+          (reduce (fn [x y]
+                    (let [a (reduce #(+ %1 (count %2)) 0 x)]
+                      (conj x (str (string-n " " (- (- y (+ level a)) 1)) "|"))))
+                  [])
+          (apply str)))])
 
 (defn- two-nodes?
   [z]
@@ -120,34 +160,34 @@
        (-> (z/left z) z/branch?)))
 
 (defn- leaf-string
-  [z h actives]
+  [z h updater]
   (str (z/node z) " " (string-n "-" (- (- h 2) (count (z/node z))))
-       "+" (levels actives h)))
+       "+" ((second updater) h)))
 
 (defn- leaf-print
-  [z actives h sep]
+  [z updater h sep]
   (let [bsh (- h (count-path z sep))
-        ns (leaf-string z bsh actives)
-        nl (str (string-n " " (- bsh 1)) "|" (string-n "-" (- sep 1)) "+" (levels actives (+ bsh sep)))]
+        ns (leaf-string z bsh updater)
+        nl (str (string-n " " (- bsh 1)) "|" (string-n "-" (- sep 1)) "+"
+                ((second updater) (+ bsh sep)))]
     (cond (and (is-left? z)
                (not (is-next-branch? z)))
-          (do (update-actives actives sep bsh) [ns nl])
+          (do ((first updater) bsh) [ns nl])
           (and (is-left? z) (is-next-branch? z))
-          (do (update-actives actives sep bsh (- bsh sep)) [ns nl])
+          (do ((first updater) bsh (- bsh sep)) [ns nl])
           (and (not (is-left? z)) (z/branch? (z/left z)))
-          (do (update-actives actives sep bsh)
-              (update-actives actives sep (- bsh sep))
-              [nl (leaf-string z bsh actives)])
+          (do ((first updater) bsh (- bsh sep))
+              [nl (leaf-string z bsh updater)])
           :else [ns])))
 
 (defn- branch-print
-  [z actives h sep]
+  [z updater h sep]
   (let [bbh (- h (count-path z sep))]
     (when (z/left z)
       (when (two-nodes? z)
-        (if-not (> (+ (* 2 sep) bbh) h) (update-actives actives sep (+ bbh sep)))
+        (if-not (>= (+ sep bbh) h) ((first updater) (+ bbh sep)))
         [(str (string-n " " bbh) (string-n " " (- sep 1)) "|"
-              (string-n "-" (- sep 1)) "+" (levels actives (+ bbh (* 2 sep))))]))))
+              (string-n "-" (- sep 1)) "+" ((second updater) (+ bbh (* 2 sep))))]))))
 
 (defn dendrogram
   "Returns a collection of strings representing a dendrogram of a
@@ -155,10 +195,10 @@
   [coll & {:keys [sep] :or {sep 3}}]
   (let [z (z/vector-zip coll)
         h (max-length z sep)
-        actives (atom {})]
+        updater (active-updater h (atom {}) sep)]
     (mapcat #(if (z/branch? %)
-               (branch-print % actives h sep)
-               (leaf-print % actives h sep))
+               (branch-print % updater h sep)
+               (leaf-print % updater h sep))
             (take-while (complement z/end?)
                         (iterate z/next z)))))
 
