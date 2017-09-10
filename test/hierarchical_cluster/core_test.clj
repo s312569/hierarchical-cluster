@@ -1,6 +1,7 @@
 (ns hierarchical-cluster.core-test
   (:require [clojure.test :refer :all]
             [clj-classify.core :as cl]
+            [clj-recommendation.core :as rec]
             [clojure.java.io :as io]
             [hierarchical-cluster.core :refer :all]
             [clojure.edn :as edn]))

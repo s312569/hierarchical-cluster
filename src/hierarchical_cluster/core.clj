@@ -5,30 +5,143 @@
             [clojure.zip :as z]
             [clojure.edn :as edn]))
 
+(declare update-similarities-new)
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; utilities
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- init-queue-new
+  [c]
+  (let [k (cl/knn-classifier (:data c) :norm (:norm c) :dist-method (:dist c) :k (count (:data c)))
+        pm (pm/priority-map-keyfn-by (queue-key c) (queue-comp c))]
+    (->> (map (fn [[cl _ _ :as x]]
+                (let [p (pm/priority-map-keyfn-by first (sim-sort-order c))
+                      nns (->> (rec/nearest-neighbours k x)
+                               (filter #((complement #{cl}) (first %)))
+                               (map (fn [[k v]] [[cl k] [(- (/ 1 v) 1) 1]]))
+                               (into p))
+                      nn (first nns)]
+                  [(-> (first nns) second) cl cl nns]))
+              (:data c))
+         (map (fn [c x] [c x]) (iterate inc 0))
+         (into pm))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; records
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defrecord centroidClusterer [data norm dist]
+  
+  Cluster
+  
+  (queue-key [c]
+    (fn [[xsc _ _ xsim :as x]]
+      (-> (cons xsc (-> xsim first first sort)) vec)))
+
+  (queue-comp [c]
+    (fn [[xsc & xkeys] [ysc & ykeys]]
+      (compare (-> (cons xsc ykeys) vec) (-> (cons ysc xkeys) vec))))
+
+  (sim-sort-order [c] <)
+
+  (cluster [c]
+    (loop [q (init-queue-new c)]
+      (let [[[xind [xsc xcl xkey xsim] :as x] [yind [ysc ycl ykey ysim] :as y] & _] (seq q)]
+        (if yind
+          (let [new-cl (with-meta [xcl ycl] {:distance xsc})
+                cl-count (count (flatten new-cl))
+                new-sims (merge xsim ysim)
+                new-i (pmap (partial (distance-updater c [xind xkey ykey cl-count new-sims]))
+                            (-> (pop q) pop))]
+            (recur (conj (->> (map first new-i) (into (empty q)))
+                         (let [cl-sims (->> (map second new-i) (into (empty xsim)))]
+                           [xind [(-> (peek cl-sims) second first) new-cl xkey cl-sims]]))))
+          xcl))))
+
+  (distance-updater [c [x-ind x-key y-key cl-count sims]]
+    (fn [[entry-index [esc entry-cl entry-key entry-sims]]]
+      (let [[hgd hco] (get sims [x-key entry-key])
+            [igd ico] (get sims [y-key entry-key])
+            [hid _] (get sims [x-key y-key])
+            new-dist (+ (* (/ hco (+ hco ico)) hgd)
+                        (* (/ ico (+ hco ico)) igd)
+                        (* (/ (* hco ico) (* (+ hco ico) (+ hco ico))) (- 1 hid)))
+            eco (if (vector? entry-cl) (-> (flatten entry-cl) count) 1)
+            new-e-sims (assoc (reduce (fn [x y] (dissoc x [entry-key y])) entry-sims [x-key y-key])
+                              [entry-key x-key] [new-dist eco])]
+        [[entry-index [(-> (peek new-e-sims) second first) entry-cl entry-key new-e-sims]]
+         [[x-key entry-key] [new-dist cl-count]]]))))
+
+(defrecord completeClusterer [data norm dist]
+
+  Cluster
+
+  (queue-key [c]
+    (fn [[xsc _ _ xsim :as x]]
+      (-> (cons xsc (-> xsim first first sort)) vec)))
+
+  (queue-comp [c]
+    (fn [[xsc & xkeys] [ysc & ykeys]]
+      (compare (-> (cons ysc xkeys) vec) (-> (cons xsc ykeys) vec))))
+
+  (sim-sort-order [c] >)
+
+  (cluster [c]
+    (loop [q (init-queue-new c)]
+      (let [[[xind [xsc xcl xkey xsim]] [yind [ysc ycl ykey ysim]] & _] (seq q)]
+        (if yind
+          (let [new-cl (with-meta [xcl ycl] {:distance xsc})
+                new-sims (merge xsim ysim)
+                sim-set (-> (flatten new-cl) set)
+                new-i (pmap (partial (distance-updater c [new-sims sim-set])) (-> (pop q) pop))]
+            (recur (conj (->> (map first new-i) (into (empty q)))
+                         (let [cl-sims (->> (map second new-i) (into (empty xsim)))]
+                           [xind [(-> (peek cl-sims) second first) new-cl xkey cl-sims]]))))
+          xcl))))
+
+  (distance-updater [c [sims sim-set]]
+    (fn [[entry-index [esc entry-cl entry-key entry-sims]]]
+      (let [e-cl-set (if (vector? entry-cl) (-> (flatten entry-cl) set) #{entry-cl})
+            [nk nd] (-> (drop-while (fn [[[x-key e-key] v]]
+                                      (not (e-cl-set e-key)))
+                                    (rseq sims))
+                        first)
+            new-e-sims (assoc (reduce (fn [x y] (dissoc x [entry-key y])) entry-sims sim-set)
+                              nk nd)]
+        [[entry-index [(-> (peek new-e-sims) second first) entry-cl entry-key entry-sims]]
+         [nk nd]]))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; cluster
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn- init-queue
-  [d dist-method norm-method type]
-  (let [k (cl/knn-classifier d :dist-method dist-method :norm norm-method :k (count d))
-        qk (fn [x] (-> (cons (if (number? (first x))
-                              (first x)
-                              (-> (first x) first))
-                            (->> (last x) first first sort)) vec))
+  [k t]
+  (let [qk (fn [[xsc _ xsim _]]
+             (-> (cons (if (number? xsc) xsc (first xsc))
+                       (-> xsim first first sort))
+                 vec))
         qc (fn [x y]
              (compare (-> (cons (first y) (drop 1 x)) vec)
                       (-> (cons (first x) (drop 1 y)) vec)))
         pm (pm/priority-map-keyfn-by qk qc)]
     (->> (map (fn [x]
-                (let [p (pm/priority-map-keyfn-by (fn [x] (if (number? x) x (first x))) >)
+                (let [p (pm/priority-map-keyfn-by (fn [x] (if (number? x) x (first x)))
+                                                  (if (= t :centroid) < >))
                       nns (->> (rec/nearest-neighbours k x)
                                (filter #((complement #{(first x)}) (first %)))
-                               (map (fn [[k v]] [[(first x) k] v]))
+                               (map (fn [[k v]]
+                                      [[(first x) k]
+                                       (if (= t :centroid)
+                                         (- (/ 1 v) 1)
+                                         v)]))
                                (into p))
                       nn (first nns)]
                   [(second nn) (first x) nns]))
-              d)
+              (:data k))
          (map (fn [c x] [c x]) (iterate inc 0))
          (into pm))))
 
@@ -36,10 +149,11 @@
 
 (defmethod cluster-distance :complete
   [[e-cl-set _ sims] _]
-  (->> (drop-while (fn [[k v]]
-                     (not (e-cl-set (second k))))
-                   (rseq sims))
-       first))
+  (let [r (->> (drop-while (fn [[k v]]
+                             (not (e-cl-set (second k))))
+                           (rseq sims))
+               first)]
+    [r [(-> (first r) reverse) (second r)]]))
 
 (defmethod cluster-distance :average
   [[e-cl-set sim-set sims] _]
@@ -51,21 +165,47 @@
         dists (->> (select-keys sims (vec ks))
                    (map (fn [[k v]] (if (number? v) [k [v 1]] [k v]))))
         total (->> (map second dists) (map #(apply * %)) (reduce +))
-        count (->> (map second dists) (map second) (reduce +))]
-    [(first (first dists)) [(/ total count) count]]))
+        count (->> (map second dists) (map second) (reduce +))
+        avg (/ total count)]
+    [[(-> (first dists) first) [avg count]]
+     [(-> (first dists) first reverse) [avg count]]]))
+
+(defmethod cluster-distance :centroid
+  [[e-cl-set sim-set sims] _]
+  (let [[[hk [hgd hco]] [ik [igd ico]]]
+        (->> (filter (fn [[k v]] (and (sim-set (first k))) (e-cl-set (second k))) sims)
+             (map (fn [[k v]] (if (number? v) [k [v 1]] [k v]))))
+        hid (->> (filter (fn [[k v]] (every? sim-set k)) sims)
+                 (map (fn [[k v]] (if (number? v) v (first v))))
+                 first)
+        new-dist (+ (* (/ hco (+ hco ico)) hgd)
+                    (* (/ ico (+ hco ico)) igd)
+                    (* (/ (* hco ico) (* (+ hco ico) (+ hco ico))) (- 1 hid)))
+        ;; t (println ico sim-set e-cl-set [[hk [hgd hco]] [ik [igd ico]]] new-dist
+        ;;             (filter (fn [[k v]] (every? sim-set k)) sims)
+        ;;             "\n")
+        ]
+    [[[(first sim-set) (first e-cl-set)] [new-dist (count sim-set)]]
+     [[(first e-cl-set) (first sim-set)] [new-dist (count e-cl-set)]]]))
 
 (defn- update-similarities
   [[index cluster sims] old-queue t]
   (let [sim-set (-> cluster flatten set)
-        nq (->> (pmap (fn [[entry-index [_ entry-cl entry-sims]]]
-                        (let [e-cl-set (if (vector? entry-cl) (-> entry-cl flatten set) #{entry-cl})
-                              gdist (cluster-distance [e-cl-set sim-set sims] t)
-                              new-sims (conj (->> (filter (fn [[k v]] (not (sim-set (second k))))
-                                                          entry-sims)
-                                                  (into (empty entry-sims)))
-                                             [(-> (first gdist) reverse) (second gdist)])]
-                          [[entry-index [(-> (peek new-sims) second) entry-cl new-sims]] gdist]))
-                      old-queue))]
+        nq (->> (map (fn [[entry-index [_ entry-cl entry-sims]]]
+                       (let [e-cl-set (if (vector? entry-cl)
+                                        (-> entry-cl flatten set)
+                                        #{entry-cl})
+                             [sgdist egdist] (cluster-distance [e-cl-set sim-set sims] t)
+                             new-sims (conj (->> (filter (fn [[k v]] (not (sim-set (second k))))
+                                                         entry-sims)
+                                                 (into (empty entry-sims)))
+                                            egdist)]
+                         [[entry-index [(-> (peek new-sims) second) entry-cl new-sims]]
+                          sgdist]))
+                     old-queue))]
+    ;; (println (conj (->> (map first nq) (into (empty old-queue)))
+    ;;                (let [n (->> (map second nq) (into (empty sims)))]
+    ;;                  [index [(-> (peek n) second) cluster n]])))
     (conj (->> (map first nq) (into (empty old-queue)))
           (let [n (->> (map second nq) (into (empty sims)))]
             [index [(-> (peek n) second) cluster n]]))))
@@ -81,31 +221,36 @@
         (map first)
         (into (empty pm1)))))
 
-(defmulti cluster (fn [q t] t))
+(defmulti cluster-old (fn [q t] t))
 
-(defmethod cluster :default
+(defmethod cluster-old :default
   [q t]
   (loop [q q]
-    (let [[x y & r] (seq q)]
-      (if y
-        (recur (update-similarities [(first x)
-                                     (with-meta [(-> (second y) second) (-> (second x) second)]
-                                       {:distance (-> (second x) first)})
-                                     (merge (-> (second x) last) (-> (second y) last))]
-                                    (-> (pop q) pop)
-                                    t))
-        (-> (drop 1 (second x)) first)))))
+    (let [[[xind [xsc xcl xsim]] [yind [ysc ycl ysim]] & _] (seq q)]
+      (if yind
+        (let [new-cl (with-meta [xcl ycl] {:distance xsc})]
+          (recur (update-similarities [xind new-cl (merge xsim ysim)] (-> (pop q) pop) t)))
+        xcl))))
 
-(defmethod cluster :single
+(defmethod cluster-old :single
   [q _]
   (loop [q q]
-    (let [[x y & r] (seq q)]
-      (if y
-        (let [mn (merge-pms (-> (second x) last) (-> (second y) last))
-              cl (with-meta [(-> (second y) second) (-> (second x) second)]
-                   {:distance (-> (second x) first)})]
-          (recur (conj (-> (pop q) pop) [(first x) [(-> (peek mn) second) cl mn]])))
-        (-> (drop 1 (second x)) first)))))
+    (let [[[xind [xsc xcl xsim]] [yind [ysc ycl ysim]] & _] (seq q)]
+      (if yind
+        (let [mn (merge-pms xsim ysim)
+              cl (with-meta [ycl xcl] {:distance xsc})]
+          (recur (conj (-> (pop q) pop) [xind [(-> (peek mn) second) cl mn]])))
+        xcl))))
+
+(defmethod cluster-old :centroid
+  [q t]
+  (loop [q q]
+    (let [[[xind [xsc xcl xsim]] [yind [ysc ycl ysim]] & _] (seq q)]
+      (if yind
+        (let [new-cl (with-meta [xcl ycl] {:distance xsc})
+              new-sims (merge xsim ysim)]
+          (recur (update-similarities [xind new-cl new-sims] (-> (pop q) pop) t)))
+        xcl))))
 
 (defn hierarchical-cluster
   "Performs hierarchical clustering and returns a nested vector of
@@ -124,7 +269,9 @@
   [data & {:keys [dist-method norm-method type]
            :or {dist-method :euclidean norm-method :mod-standard-score
                 type :single}}]
-  (-> (init-queue data dist-method norm-method type) (cluster type)))
+  (let [k (cl/knn-classifier data :dist-method dist-method :norm norm-method :k (count data))
+        q (init-queue k type)]
+    (cluster-old q type)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dendrogram
